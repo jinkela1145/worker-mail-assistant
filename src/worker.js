@@ -7,7 +7,7 @@ export default {
     const tgChatId = env.TG_CHAT_ID;
     const geminiApiKey = env.GEMINI_API_KEY;
     
-    // 灵活配置：允许通过 env 注入自定义模型和反代 URL。如果不填，默认使用官方直连和 1.5-flash
+    // 灵活配置：允许通过 env 注入自定义模型和反代 URL
     const geminiModel = env.GEMINI_MODEL || "gemini-1.5-flash"; 
     const geminiApiBase = env.GEMINI_API_BASE || "https://generativelanguage.googleapis.com/v1beta/models/";
 
@@ -16,7 +16,7 @@ export default {
       const parser = new PostalMime();
       const email = await parser.parse(message.raw);
 
-      // 2. 提取收发件人
+      // 2. 提取收发件人信息
       let myOriginalEmail = message.to;
       if (email.to && email.to.length > 0) {
         myOriginalEmail = email.to[0].address; 
@@ -28,12 +28,27 @@ export default {
       const bodyContent = email.text || email.html || "无正文内容";
       const decodedBody = bodyContent.substring(0, 3000); 
 
-      // 3. 附件预检 (防 OOM 内存溢出)
-      const validAttachments = (email.attachments || []).filter(att => {
-        return att.content.byteLength > 2048 && att.content.byteLength < 15 * 1024 * 1024; 
-      });
-      const hasAttachment = validAttachments.length > 0;
-      let attachmentPrompt = hasAttachment ? `（提醒：邮件包含 ${validAttachments.length} 个有效附件，请在摘要说明）` : "";
+      // 3. 附件分类预检 (防 OOM 内存溢出)
+      const allAttachments = email.attachments || [];
+      const validAttachments = [];    // 准备转发的附件 (<15MB)
+      const oversizedAttachments = []; // 超大附件 (>15MB)
+      
+      for (const att of allAttachments) {
+        const size = att.content.byteLength;
+        if (size >= 15 * 1024 * 1024) {
+          oversizedAttachments.push(att);
+        } else if (size > 2048) { // 过滤掉小于 2KB 的图标
+          validAttachments.push(att);
+        }
+      }
+
+      const hasValid = validAttachments.length > 0;
+      const hasOversized = oversizedAttachments.length > 0;
+      
+      // 动态生成给 AI 的提示词
+      let attachmentPrompt = "";
+      if (hasValid) attachmentPrompt += `（提醒：邮件包含 ${validAttachments.length} 个可转发附件，请在摘要中提及）`;
+      if (hasOversized) attachmentPrompt += `（提醒：邮件包含 ${oversizedAttachments.length} 个超过15MB的超大附件，请在摘要末尾加上『📎 包含超大附件，请打开邮箱查看』）`;
 
       // 4. 请求 AI 处理
       const aiUrl = `${geminiApiBase}${geminiModel}:generateContent?key=${geminiApiKey}`;
@@ -48,34 +63,40 @@ export default {
   "link": "string", 
   "summary": "string" 
 }
-邮件内容：\n主题: ${subject}\n发件人: ${fromName}\n内容: ${decodedBody}\n${attachmentPrompt}`
+邮件内容：
+主题: ${subject}
+发件人: ${fromName}
+内容: ${decodedBody}
+${attachmentPrompt}
+
+🚨 摘要生成特别指令：
+1. 如果是往来回复的邮件，必须使用句式：“针对【上一句原文核心内容】，对方回复了：【最新回复内容】”。
+2. 如果是普通新邮件，则正常总结。`
           }]
         }]
       };
 
       const aiResponse = await fetch(aiUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(aiPayload) });
-
-      // 🚨 新增：拦截非 200 的报错状态，直接打印出 Gemini 官方的错误详情
-      if (!aiResponse.ok) {
-        const errorText = await aiResponse.text();
-        throw new Error(`Gemini 接口报错 (状态码: ${aiResponse.status}): ${errorText.substring(0, 500)}`);
-      }
-
       const aiData = await aiResponse.json();
       let aiText = (aiData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}").replace(/```json/gi, '').replace(/```/g, '').trim();
       
       let parsedAI = { is_promo: false, is_renewal: false, code: "", link: "", summary: "解析失败" };
       try { parsedAI = JSON.parse(aiText); } catch (e) {}
 
-      if (parsedAI.is_promo === true) return; // 广告静默丢弃
+      if (parsedAI.is_promo === true) return; 
 
-      // 5. 推送纯文本摘要
+      // 5. 构建并推送 Telegram 文字消息
       let tgMsg = parsedAI.is_renewal ? `❗❗❗ <b>【续费/到期提醒】</b> ❗❗❗\n\n` : `📧 <b>新邮件到达</b>\n\n`;
       tgMsg += `🎯 <b>接收:</b> <code>${myOriginalEmail}</code>\n`; 
       tgMsg += `👤 <b>发件:</b> ${fromName} (<code>${fromEmail}</code>)\n`; 
       tgMsg += `📝 <b>主题:</b> ${subject}\n\n`;
       if (parsedAI.code && parsedAI.code.length < 15) tgMsg += `🔑 <b>验证码:</b> <code>${parsedAI.code}</code>\n\n`;
       tgMsg += `🤖 <b>AI摘要:</b>\n${parsedAI.summary}`;
+
+      // 如果有超大附件，在消息末尾显眼标记
+      if (hasOversized) {
+        tgMsg += `\n\n⚠️ <b>超大附件提醒:</b>\n检测到 ${oversizedAttachments.length} 个附件超过 15MB，Worker 无法直接转发，请务必登录原邮箱查看详情。`;
+      }
 
       let reply_markup = {};
       if (parsedAI.link) reply_markup = { inline_keyboard: [[{ text: "🔗 快捷跳转 / 确认操作", url: parsedAI.link }]] };
@@ -87,13 +108,13 @@ export default {
           chat_id: tgChatId, 
           text: tgMsg, 
           parse_mode: "HTML", 
-          link_preview_options: { is_disabled: true }, // 使用 Telegram 最新规范关闭链接预览
+          link_preview_options: { is_disabled: true }, 
           reply_markup: Object.keys(reply_markup).length > 0 ? reply_markup : undefined 
         })
       });
 
-      // 6. 推送附件
-      if (hasAttachment) {
+      // 6. 推送可转发的附件
+      if (hasValid) {
         const maxAttachments = Math.min(validAttachments.length, 3);
         for (let i = 0; i < maxAttachments; i++) {
           const file = validAttachments[i];
