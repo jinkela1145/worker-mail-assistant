@@ -54,6 +54,13 @@ export default {
       };
 
       const aiResponse = await fetch(aiUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(aiPayload) });
+
+      // 🚨 新增：拦截非 200 的报错状态，直接打印出 Gemini 官方的错误详情
+      if (!aiResponse.ok) {
+        const errorText = await aiResponse.text();
+        throw new Error(`Gemini 接口报错 (状态码: ${aiResponse.status}): ${errorText.substring(0, 500)}`);
+      }
+
       const aiData = await aiResponse.json();
       let aiText = (aiData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}").replace(/```json/gi, '').replace(/```/g, '').trim();
       
